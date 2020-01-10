@@ -17,13 +17,16 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"bytes"
+	"labgob"
+	"labrpc"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -42,6 +45,14 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+const (
+	Follower          = "Follower"
+	Candidate         = "Candidate"
+	Leader            = "Leader"
+	heartbeatInterval = 100 // millisecond
+	checkInterval     = 10  // millisecond
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,6 +66,29 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on all servers
+	CurrentTerm int         // latest term server has seen, increases monotonically
+	VotedFor    int         // CandidateID that received vote in current term
+	Log         []*LogEntry // log entries. each entry contains command for state matchine, and term when entry was received by leader
+
+	// Volatile state on all servers
+	CommitIndex int // index of highest log entry known to be committed
+	LastApplied int // index of highest log entry applied to state machine
+
+	// Volatile state on leaders
+	NextIndex  []int // for each server, index of the next log entry to send to that server, init to leader last log index+1
+	MatchIndex []int // for each server, index of highest log entry kown to be replicated on server
+
+	State     string
+	ExpiredAt time.Time
+	VoteCount int
+	applyChan chan ApplyMsg
+}
+
+// LogEntry stores a state machine command along with the term.
+type LogEntry struct {
+	Term    int         // The term number when the entry was received by the leader
+	Command interface{} // The command received from client
 }
 
 // return currentTerm and whether this server
@@ -64,9 +98,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.CurrentTerm
+	isleader = rf.State == Leader
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -82,14 +120,32 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-}
 
+	RPrintf(rf, "saving Raft state: <term:%v, votedFor:%v, #log:%v>", rf.CurrentTerm, rf.VotedFor, len(rf.Log))
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	RPrintf(rf, "saved: <term:%v, votedFor:%v, #log:%v>", rf.CurrentTerm, rf.VotedFor, len(rf.Log))
+}
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	RPrintf(rf, "reading saved states...")
+
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		RPrintf(rf, "no states saved, skipped")
 		return
 	}
 	// Your code here (2C).
@@ -105,32 +161,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
 
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	var CurrentTerm int
+	var VotedFor int
+	var Log []*LogEntry
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&VotedFor) != nil || d.Decode(&Log) != nil {
+		RPrintf(rf, "error in decoding")
+	} else {
+		rf.CurrentTerm = CurrentTerm
+		rf.VotedFor = VotedFor
+		rf.Log = Log
+	}
+	RPrintf(rf, "loaded with: <term:%v, votedFor:%v, #log:%v>", rf.CurrentTerm, rf.VotedFor, len(rf.Log))
 }
 
 //
@@ -167,6 +211,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -183,13 +231,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
-
+	RPrintf(rf, "try append entries:<command:%v>", command)
+	index, term, isLeader := rf.leaderAddEntry(command)
 	return index, term, isLeader
 }
 
@@ -216,16 +260,88 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+
+	rf := NewRaft(peers, persister, me, applyCh)
 
 	// Your initialization code here (2A, 2B, 2C).
+	go stateLooper(rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// start applyer
+	go Applyer(rf)
 
 	return rf
+}
+
+// NewRaft creates a new raft.
+func NewRaft(peers []*labrpc.ClientEnd, persister *Persister, me int, applyCh chan ApplyMsg) (rf *Raft) {
+	rf = &Raft{
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		VotedFor:    -1,       // -1 means voted for none
+		State:       Follower, // started as a follower,
+		CommitIndex: 0,
+		LastApplied: 0,
+		applyChan:   applyCh,
+	}
+	rf.resetElectionTimeout()
+	return rf
+}
+
+// stateLooper checks the Raft's current state and puts it into the right loop
+func stateLooper(rf *Raft) {
+	// no need to sleep
+	for {
+		// lock read
+		rf.mu.Lock()
+		currentState := rf.State
+		RPrintf(rf, "got state change, looping...")
+		rf.mu.Unlock()
+
+		switch currentState {
+
+		case Follower:
+			rf.followerState()
+		case Leader:
+			rf.leaderState()
+		case Candidate:
+			rf.candidateState()
+		}
+	}
+}
+
+// Applyer applied changes to state machines
+func Applyer(rf *Raft) {
+	RPrintf(rf, "Applyer started...")
+	for {
+		time.Sleep(time.Duration(checkInterval) * time.Millisecond)
+		globalRule5_3(rf)
+	}
+}
+
+// globalRule5_3 enforces Rule 5.3.
+// if commitIndex > lastApplied, increment lastApplied, apply log[lastApplied]
+// to state machine.
+func globalRule5_3(rf *Raft) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for rf.CommitIndex > rf.LastApplied {
+		RPrintf(rf, "found CommitIndex, applying it, <CommitIndex:%v, LastApplied:%v>", rf.CommitIndex, rf.LastApplied)
+		entry := rf.Log[rf.LastApplied]
+		rf.LastApplied++
+		rf.sendApplyMsg(rf.LastApplied, entry)
+	}
+}
+
+func (rf *Raft) sendApplyMsg(index int, entry *LogEntry) {
+	rf.applyChan <- ApplyMsg{
+		CommandValid: true,
+		Command:      entry.Command,
+		CommandIndex: index,
+	}
+	RPrintf(rf, "applyChan -> sending ApplyMsg: <Command:%v, CommandIndex:%v>", entry.Command, index)
 }

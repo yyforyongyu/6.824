@@ -329,6 +329,7 @@ func TestRejoin2B(t *testing.T) {
 
 func TestBackup2B(t *testing.T) {
 	servers := 5
+	logs := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
 
@@ -343,7 +344,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
-	for i := 0; i < 50; i++ {
+	for i := 0; i < logs; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
@@ -358,7 +359,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
-	for i := 0; i < 50; i++ {
+	for i := 0; i < logs; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
@@ -371,7 +372,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect(other)
 
 	// lots more commands that won't commit
-	for i := 0; i < 50; i++ {
+	for i := 0; i < logs; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
 
@@ -386,7 +387,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect(other)
 
 	// lots of successful commands to new group.
-	for i := 0; i < 50; i++ {
+	for i := 0; i < logs; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
@@ -636,7 +637,7 @@ func TestPersist32C(t *testing.T) {
 // iteration asks a leader, if there is one, to insert a command in the Raft
 // log.  If there is a leader, that leader will fail quickly with a high
 // probability (perhaps without committing the command), or crash after a while
-// with low probability (most likey committing the command).  If the number of
+// with low probability (most likely committing the command).  If the number of
 // alive servers isn't enough to form a majority, perhaps start a new server.
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.

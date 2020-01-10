@@ -252,6 +252,7 @@ func (cfg *config) connect(i int) {
 			cfg.net.Enable(endname, true)
 		}
 	}
+	CPrintf("<peer:%v> connected", i)
 }
 
 // detach server i from the net.
@@ -275,6 +276,7 @@ func (cfg *config) disconnect(i int) {
 			cfg.net.Enable(endname, false)
 		}
 	}
+	CPrintf("<peer:%v> disconnected", i)
 }
 
 func (cfg *config) rpcCount(server int) int {
@@ -498,6 +500,6 @@ func (cfg *config) end() {
 		cfg.mu.Unlock()
 
 		fmt.Printf("  ... Passed --")
-		fmt.Printf("  %4.1f  %d %4d %4d\n", t, npeers, nrpc, ncmds)
+		fmt.Printf("  time:%4.1f seconds\t#Peers:%d\t#RPCs:%d\t#Agreements:%d\n", t, npeers, nrpc, ncmds)
 	}
 }
